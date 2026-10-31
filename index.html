@@ -62,6 +62,7 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
 #mmlNote { font-size: 12px; color: #ffb4bc; }
 #mmlNote:empty { display: none; }
 #mmlText { box-sizing: border-box; width: 100%; height: 2.8em; resize: none; font: 400 12px var(--mono); color: var(--ivory); background: var(--lacquer-2); border: 1px solid var(--lacquer-3); border-radius: 6px; padding: 6px; }
+.hint { flex: none; font-size: 12px; color: var(--muted); white-space: nowrap; }
 </style></head><body>
 
 <div id="app">
@@ -95,7 +96,7 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
         <select id="floor"><option value="48">C3</option><option value="55">G3</option><option value="60" selected>C4</option><option value="67">G4</option><option value="72">C5</option></select>
       </label>
     </div>
-    <div class="row"><div id="parts"></div><button class="btn" id="copyAll">全パートをコピー</button><button class="btn primary" id="saveMml">MMLを保存</button></div>
+    <div class="row"><div id="parts"></div><span class="hint">ボタンをタップしてコピー</span><button class="btn primary" id="saveMml">MMLを保存</button></div>
     <div id="mmlNote"></div>
     <textarea id="mmlText" rows="2" readonly aria-label="MML"></textarea>
   </div>
@@ -730,7 +731,6 @@ $('grid').onclick = e => {
   renderMml();
 };
 $('chords').onchange = $('floor').onchange = () => renderMml();
-$('copyAll').onclick = e => copyText($('mmlText').value, e.target);
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([$('mmlText').value], { type: 'text/plain' }));
