@@ -449,9 +449,10 @@ function splitVoices(notes, count) {
         i = free.reduce((a, v) => voices[v].at(-1)[0] < voices[a].at(-1)[0] ? v : a);
         voices[i].at(-1)[1] = start;
       } else {
-        // Keep lines continuous: stay near the part's last note and range, and open a new part only when needed.
+        // Keep lines continuous: follow a part ending exactly here, then stay near its last note and range.
+        const touching = v => voices[v].length > 0 && voices[v].at(-1)[1] === start;
         const dist = v => last[v] === null ? 1e6 : Math.abs(note[2] - last[v]) + .3 * Math.abs(note[2] - center[v]);
-        i = free.reduce((a, v) => dist(v) < dist(a) ? v : a);
+        i = free.reduce((a, v) => touching(v) !== touching(a) ? (touching(v) ? v : a) : dist(v) < dist(a) ? v : a);
       }
       voices[i].push(note.slice());
       center[i] = center[i] === null ? note[2] : center[i] * .9 + note[2] * .1;
