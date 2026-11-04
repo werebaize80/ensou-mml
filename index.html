@@ -95,6 +95,9 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <label class="field" for="floor" title="これより低い音はメロディに選びません">メロディの下限
         <select id="floor"><option value="48">C3</option><option value="55">G3</option><option value="60" selected>C4</option><option value="67">G4</option><option value="72">C5</option></select>
       </label>
+      <label class="field" for="split" title="和音パートへの音の振り分け方">和音の分け方
+        <select id="split"><option value="line">流れ優先</option><option value="range" selected>音域で固定</option></select>
+      </label>
     </div>
     <div class="row"><div id="parts"></div><span class="hint">ボタンをタップしてコピー</span><button class="btn primary" id="saveMml">MMLを保存</button></div>
     <div id="mmlNote"></div>
@@ -487,12 +490,37 @@ function partMml(notes, bpm) {
   return mml;
 }
 
-function convertMml(raw, ppq, bpm, grid, chords, floor) {
+function splitRanges(notes, count) {
+  // Keep exactly the notes splitVoices keeps, then lay them out like soprano, alto, tenor: each part keeps its own range.
+  const { voices: lines, dropped } = splitVoices(notes, count);
+  const kept = lines.flat(), voices = Array.from({ length: count }, () => []);
+  if (!kept.length) return { voices, dropped };
+  const pitches = kept.map(n => n[2]).sort((a, b) => a - b);
+  const center = voices.map((_, v) => pitches[Math.floor((count - v - .5) / count * pitches.length)]), groups = new Map();
+  for (const n of kept) { if (!groups.has(n[0])) groups.set(n[0], []); groups.get(n[0]).push(n); }
+  for (const start of [...groups.keys()].sort((a, b) => a - b)) {
+    const chord = groups.get(start).slice().sort((a, b) => b[2] - a[2]);
+    // Parts still holding a note are skipped; the kept notes never overlap more than count, so all fit.
+    const free = [...voices.keys()].filter(v => !voices[v].length || voices[v].at(-1)[1] <= start);
+    const k = chord.length, m = free.length, f = Array.from({ length: k + 1 }, (_, a) => Array(m + 1).fill(a ? Infinity : 0));
+    for (let a = 1; a <= k; a++) for (let b = a; b <= m; b++) f[a][b] = Math.min(f[a][b - 1], f[a - 1][b - 1] + Math.abs(chord[a - 1][2] - center[free[b - 1]]));
+    for (let a = k, b = m; a;) {
+      if (f[a][b] === f[a][b - 1]) { b--; continue; }
+      const note = chord[a - 1], v = free[b - 1];
+      voices[v].push(note);
+      center[v] = center[v] * .95 + note[2] * .05;
+      a--; b--;
+    }
+  }
+  return { voices, dropped };
+}
+
+function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range') {
   const clipped = raw.filter(n => n.m > MAX_PITCH).length;
   const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq, grid);
   const melody = pickMelody(notes, floor);
   const taken = new Set(melody.map(n => n[0] * 128 + n[2]));
-  const { voices, dropped } = splitVoices(notes.filter(n => !taken.has(n[0] * 128 + n[2])), chords);
+  const { voices, dropped } = (split === 'range' ? splitRanges : splitVoices)(notes.filter(n => !taken.has(n[0] * 128 + n[2])), chords);
   const parts = [melody.length ? partMml(melody, bpm) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
 }
@@ -702,7 +730,7 @@ async function copyText(text, btn) {
 
 function renderMml(fromStart) {
   const raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes);
-  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value);
+  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -731,7 +759,7 @@ $('grid').onclick = e => {
   for (const x of $('grid').children) x.setAttribute('aria-pressed', x === b);
   renderMml();
 };
-$('chords').onchange = $('floor').onchange = () => renderMml();
+$('chords').onchange = $('floor').onchange = $('split').onchange = () => renderMml();
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([$('mmlText').value], { type: 'text/plain' }));
