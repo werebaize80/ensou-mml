@@ -98,6 +98,9 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <label class="field" for="split" title="和音パートへの音の振り分け方">和音の分け方
         <select id="split"><option value="line">流れ優先</option><option value="range" selected>音域で固定</option></select>
       </label>
+      <label class="field" for="overlap" title="メロディの音が次の音と重なったときの扱い">メロディが重なった時
+        <select id="overlap"><option value="chord" selected>和音に回す</option><option value="cut">カットしてメロディ</option></select>
+      </label>
     </div>
     <div class="row"><div id="parts"></div><span class="hint">ボタンをタップしてコピー</span><button class="btn primary" id="saveMml">MMLを保存</button></div>
     <div id="mmlNote"></div>
@@ -396,7 +399,7 @@ function quantize(raw, ppq, grid) {
   return notes;
 }
 
-function pickMelody(notes, floor) {
+function pickMelody(notes, floor, overlap = 'chord') {
   const ordered = notes.slice().sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]);
   const groups = new Map();
   ordered.forEach((n, i) => {
@@ -404,7 +407,8 @@ function pickMelody(notes, floor) {
     for (let k = i - 1; k >= 0; k--) {
       const q = ordered[k];
       if (q[0] < n[0] - 480) break;
-      if (q[0] < n[0] && n[0] < q[1] && q[2] > n[2]) return; // a higher note is still ringing: accompaniment
+      // A higher note still ringing is the melody; with "cut", only when it rings through this whole note.
+      if (q[0] < n[0] && n[0] < q[1] && q[2] > n[2] && (overlap === 'chord' || q[1] >= n[1])) return;
     }
     if (!groups.has(n[0])) groups.set(n[0], []);
     groups.get(n[0]).push(n);
@@ -515,10 +519,10 @@ function splitRanges(notes, count) {
   return { voices, dropped };
 }
 
-function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range') {
+function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord') {
   const clipped = raw.filter(n => n.m > MAX_PITCH).length;
   const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq, grid);
-  const melody = pickMelody(notes, floor);
+  const melody = pickMelody(notes, floor, overlap);
   const taken = new Set(melody.map(n => n[0] * 128 + n[2]));
   const { voices, dropped } = (split === 'range' ? splitRanges : splitVoices)(notes.filter(n => !taken.has(n[0] * 128 + n[2])), chords);
   const parts = [melody.length ? partMml(melody, bpm) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
@@ -730,7 +734,7 @@ async function copyText(text, btn) {
 
 function renderMml(fromStart) {
   const raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes);
-  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value);
+  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -759,7 +763,7 @@ $('grid').onclick = e => {
   for (const x of $('grid').children) x.setAttribute('aria-pressed', x === b);
   renderMml();
 };
-$('chords').onchange = $('floor').onchange = $('split').onchange = () => renderMml();
+$('chords').onchange = $('floor').onchange = $('split').onchange = $('overlap').onchange = () => renderMml();
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([$('mmlText').value], { type: 'text/plain' }));
