@@ -104,9 +104,7 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <label class="field" for="overlap" title="メロディの音が次の音と重なったときの扱い">メロディが重なった時
         <select id="overlap"><option value="chord" selected>和音に回す</option><option value="cut">カットしてメロディ</option></select>
       </label>
-      <label class="field" id="subField" for="sub" title="メロディの下限より下で、この音までのメロディを和音1に優先して入れます（音域で固定のとき）">和音1でメロディ補助
-        <select id="sub"><option value="0" selected>なし</option><option value="48">C3から</option><option value="55">G3から</option><option value="60">C4から</option><option value="67">G4から</option></select>
-      </label>
+      <label class="field" id="subField" title="メロディの重なり、2本目のメロディ、2400字に入りきらないメロディを和音1に優先して入れます（音域で固定のとき）"><input type="checkbox" id="sub">和音1でメロディ補助</label>
     </div>
     <div class="row"><div id="parts"></div><span class="hint">ボタンをタップしてコピー</span><button class="btn primary" id="saveMml">MMLを保存</button></div>
     <div id="mmlNote"></div>
@@ -542,49 +540,162 @@ function partMml(notes, bpm, marks = new Map()) {
   return mml;
 }
 
-// spill: notes the melody overlapped or let go; they take the first free part (chord 1, then 2, ...).
-function splitRanges(notes, count, spill = new Set()) {
-  // Keep exactly the notes splitVoices keeps, then lay them out like soprano, alto, tenor: each part keeps its own range.
-  const { voices: lines, dropped } = splitVoices(notes, count);
+// spill: Map of start*128+pitch -> rank for melody notes handed to the chords; they take the first free
+// part (chord 1, then 2, ...), lower rank first.
+// reserve: chord 1 belongs to them. Other notes go elsewhere when they would still ring at the next spill note;
+// if nowhere else is free, they are cut short there. A new spill note cuts a ringing one of the same or lower
+// priority, so chord 1 plays like a melody.
+// banned: measures (1920 ticks) where chord 1 takes no other notes; a note with no other place is dropped.
+function splitRanges(notes, count, spill = new Map(), reserve = false, banned = new Set()) {
+  const key = n => n[0] * 128 + n[2];
+  let { voices: lines, dropped } = splitVoices(notes, count);
   const kept = lines.flat(), voices = Array.from({ length: count }, () => []);
   if (!kept.length) return { voices, dropped };
   const pitches = kept.map(n => n[2]).sort((a, b) => a - b);
   const center = voices.map((_, v) => pitches[Math.floor((count - v - .5) / count * pitches.length)]), groups = new Map();
   for (const n of kept) { if (!groups.has(n[0])) groups.set(n[0], []); groups.get(n[0]).push(n); }
+  const marks = reserve ? [...new Set(kept.filter(n => spill.has(key(n))).map(n => n[0]))].sort((a, b) => a - b) : [];
+  const blocks = n => {
+    let lo = 0, hi = marks.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; marks[m] <= n[0] ? lo = m + 1 : hi = m; }
+    return lo < marks.length && n[1] > marks[lo] ? marks[lo] : null;
+  };
+  const cost = (n, v) => v !== 0 ? Math.abs(n[2] - center[v])
+    : banned.has(Math.floor(n[0] / 1920)) ? Infinity : Math.abs(n[2] - center[v]) + (blocks(n) !== null ? 1000 : 0);
+  const DROP = 1e6;
   for (const start of [...groups.keys()].sort((a, b) => a - b)) {
     const chord = groups.get(start).slice().sort((a, b) => b[2] - a[2]);
     // Parts still holding a note are skipped; the kept notes never overlap more than count, so all fit.
     const free = [...voices.keys()].filter(v => !voices[v].length || voices[v].at(-1)[1] <= start);
-    for (const note of chord.filter(n => spill.has(n[0] * 128 + n[2]))) {
-      voices[free.shift()].push(note);
+    for (const note of chord.filter(n => spill.has(key(n))).sort((a, b) => spill.get(key(a)) - spill.get(key(b)))) {
+      const head = voices[0].at(-1);
+      if (reserve && !free.includes(0) && head && spill.has(key(head)) && head[0] < start && spill.get(key(note)) <= spill.get(key(head))) {
+        // Chord 1 plays like a melody: a new line note cuts the one still ringing.
+        voices[0][voices[0].length - 1] = [head[0], start, head[2], head[3]];
+        free.unshift(0);
+      }
+      if (free.length) voices[free.shift()].push(note); else dropped++;
       chord.splice(chord.indexOf(note), 1);
     }
+    // Order-keeping match of chord notes (high to low) onto free parts (high to low), nearest to each range.
+    // A note may also be dropped, at a cost far above any placement.
     const k = chord.length, m = free.length, f = Array.from({ length: k + 1 }, (_, a) => Array(m + 1).fill(a ? Infinity : 0));
-    for (let a = 1; a <= k; a++) for (let b = a; b <= m; b++) f[a][b] = Math.min(f[a][b - 1], f[a - 1][b - 1] + Math.abs(chord[a - 1][2] - center[free[b - 1]]));
+    for (let a = 1; a <= k; a++) {
+      f[a][0] = f[a - 1][0] + DROP;
+      for (let b = 1; b <= m; b++) f[a][b] = Math.min(f[a][b - 1], f[a - 1][b] + DROP, f[a - 1][b - 1] + cost(chord[a - 1], free[b - 1]));
+    }
     for (let a = k, b = m; a;) {
-      if (f[a][b] === f[a][b - 1]) { b--; continue; }
-      const note = chord[a - 1], v = free[b - 1];
-      voices[v].push(note);
-      center[v] = center[v] * .95 + note[2] * .05;
-      a--; b--;
+      if (b && f[a][b] === f[a][b - 1]) { b--; continue; }
+      if (b && f[a][b] === f[a - 1][b - 1] + cost(chord[a - 1], free[b - 1])) {
+        let note = chord[a - 1];
+        const v = free[b - 1];
+        if (v === 0 && blocks(note) !== null) note = [note[0], blocks(note), note[2], note[3]];
+        voices[v].push(note);
+        center[v] = center[v] * .95 + note[2] * .05;
+        a--; b--;
+      } else { dropped++; a--; }
     }
   }
   return { voices, dropped };
 }
 
-// sub: a lower melody floor; melody notes between sub and floor go to chord 1 first (with split "range").
+// Move notes out of chord parts over PART_LIMIT into parts with room, one whole measure at a time.
+// Each part may be played by its own instrument, so a measure moves as a block to a single part: the one
+// nearest in pitch that is silent there and stays within the limit. A measure that fits nowhere stays.
+// The busiest measures of the long part go first, so few measures move. keep: notes that stay in chord 1.
+function balance(voices, keep = new Map()) {
+  voices = voices.map(v => v.slice());
+  const size = voices.map(v => v.length ? partMml(v).length : 0), bar = n => Math.floor(n[0] / 1920);
+  const order = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || a[3] - b[3];
+  const fits = (v, n) => {
+    const list = voices[v];
+    let lo = 0, hi = list.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; list[m][0] < n[0] ? lo = m + 1 : hi = m; }
+    return (lo === 0 || list[lo - 1][1] <= n[0]) && (lo === list.length || n[1] <= list[lo][0]);
+  };
+  const height = v => voices[v].length ? voices[v].reduce((t, q) => t + q[2], 0) / voices[v].length : 60;
+  for (const src of [...voices.keys()].sort((a, b) => size[b] - size[a])) {
+    if (size[src] <= PART_LIMIT) continue;
+    const counts = new Map();
+    for (const n of voices[src]) counts.set(bar(n), (counts.get(bar(n)) || 0) + 1);
+    for (const [b] of [...counts].sort((x, y) => y[1] - x[1])) {
+      if (size[src] <= PART_LIMIT) break;
+      const block = voices[src].filter(n => bar(n) === b && !(src === 0 && keep.has(n[0] * 128 + n[2])));
+      if (!block.length) continue;
+      const pitch = block.reduce((t, n) => t + n[2], 0) / block.length;
+      const targets = [...voices.keys()].filter(v => v !== src && size[v] < PART_LIMIT).sort((x, y) => Math.abs(height(x) - pitch) - Math.abs(height(y) - pitch));
+      for (const dst of targets) {
+        if (!block.every(n => fits(dst, n))) continue;
+        const trial = [...voices[dst], ...block].sort(order), length = partMml(trial).length;
+        if (length > PART_LIMIT) continue;
+        voices[dst] = trial; size[dst] = length;
+        const gone = new Set(block);
+        voices[src] = voices[src].filter(n => !gone.has(n));
+        size[src] = voices[src].length ? partMml(voices[src]).length : 0;
+        break;
+      }
+    }
+  }
+  return voices;
+}
+
+// sub: when on, chord 1 helps the melody (with split "range"), taking in order of priority the melody overlaps,
+// a second melody line under the same floor, and the measures of melody that do not fit in PART_LIMIT (emptiest
+// measures first). Other chords use chord 1 only while it stays within PART_LIMIT.
+// Any chord part over PART_LIMIT hands whole measures to parts with room (see balance).
 // tempos: the MIDI tempo map; when given, tempo changes are written into the melody part (longer MML).
 // beat 2 doubles the beat: same speed, written at twice the tempo with longer note lengths.
 function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord', sub = 0, beat = 1, tempos = null) {
   const clipped = raw.filter(n => n.m > MAX_PITCH).length;
   const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq / beat, grid);
   bpm *= beat;
+  const key = n => n[0] * 128 + n[2], bar = n => Math.floor(n[0] / 1920);
   const spill = new Set();
-  const melody = pickMelody(notes, floor, overlap, spill);
-  const taken = new Set(melody.map(n => n[0] * 128 + n[2]));
-  if (sub && sub < floor) for (const n of pickMelody(notes, sub, overlap)) if (!taken.has(n[0] * 128 + n[2])) spill.add(n[0] * 128 + n[2]);
-  const rest = notes.filter(n => !taken.has(n[0] * 128 + n[2]));
-  const { voices, dropped } = split === 'range' ? splitRanges(rest, chords, spill) : splitVoices(rest, chords);
+  let melody = pickMelody(notes, floor, overlap, spill);
+  const rank = new Map([...spill].map(k => [k, 0])); // chord 1 priority: 0 melody overlaps, 1 second line, 2 melody overflow
+  if (sub) {
+    const first = new Set(melody.map(key));
+    for (const n of pickMelody(notes.filter(n => !first.has(key(n))), floor, overlap)) if (!rank.has(key(n))) rank.set(key(n), 1);
+    const guess = tempos && melody.length ? tempoMarks([notes], tempos, ppq, 480 * beat / ppq) : undefined;
+    if (melody.length && partMml(melody, bpm, guess).length > PART_LIMIT) {
+      // Hand whole measures of melody to chord 1 until the melody fits, the emptiest measures first,
+      // so chord 1 still has room for chords spread over the song.
+      const busy = new Map();
+      for (const n of notes) if (!first.has(key(n))) busy.set(bar(n), (busy.get(bar(n)) || 0) + 1);
+      const moved = new Set();
+      for (const b of [...new Set(melody.map(bar))].sort((x, y) => (busy.get(x) || 0) - (busy.get(y) || 0) || x - y)) {
+        moved.add(b);
+        if (partMml(melody.filter(n => !moved.has(bar(n))), bpm, guess).length <= PART_LIMIT) break;
+      }
+      for (const n of melody) if (moved.has(bar(n)) && !rank.has(key(n))) rank.set(key(n), 2);
+      melody = melody.filter(n => !moved.has(bar(n)));
+    }
+  }
+  const taken = new Set(melody.map(key));
+  const rest = notes.filter(n => !taken.has(key(n)));
+  const keep = sub ? rank : new Map();
+  let voices, dropped;
+  if (split !== 'range') {
+    ({ voices, dropped } = splitVoices(rest, chords));
+    voices = balance(voices);
+  } else {
+    ({ voices, dropped } = splitRanges(rest, chords, rank, !!sub));
+    voices = balance(voices, keep);
+    if (sub && voices[0].length && partMml(voices[0]).length > PART_LIMIT) {
+      // Chord 1 is over the limit: keep the other chords out of it, measure by measure,
+      // starting where it holds the most of them, until it fits.
+      const extra = new Map();
+      for (const n of voices[0]) if (!rank.has(key(n))) extra.set(bar(n), (extra.get(bar(n)) || 0) + 1);
+      const order = [...extra].sort((x, y) => y[1] - x[1]).map(x => x[0]);
+      let lo = 1, hi = order.length, best = null;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1, trial = splitRanges(rest, chords, rank, true, new Set(order.slice(0, mid)));
+        trial.voices = balance(trial.voices, keep);
+        if (!trial.voices[0].length || partMml(trial.voices[0]).length <= PART_LIMIT) { best = trial; hi = mid - 1; } else lo = mid + 1;
+      }
+      if (best) ({ voices, dropped } = best);
+    }
+  }
   const marks = tempos && melody.length ? tempoMarks([melody, ...voices], tempos, ppq, 480 * beat / ppq) : undefined;
   const parts = [melody.length ? partMml(melody, bpm, marks) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
@@ -827,7 +938,7 @@ function renderMml(fromStart) {
   let raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes), ppq = source.ppq, bpm = source.bpm;
   const tempo = $('tempo').value;
   if (tempo === 'steady') ({ raw, bpm } = steadyGrid(raw, source.tempos || [], ppq)), ppq = 480;
-  result = convertMml(raw, ppq, Math.round(bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value, tempo === 'vary' ? source.tempos || [] : null);
+  result = convertMml(raw, ppq, Math.round(bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden || !$('sub').checked ? 0 : 1, +$('beat').value, tempo === 'vary' ? source.tempos || [] : null);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -855,12 +966,8 @@ $('grid').onclick = e => {
   for (const x of $('grid').children) x.setAttribute('aria-pressed', x === b);
   renderMml();
 };
-// The helper only offers starts below the melody floor, and is hidden when overlapping melody notes are cut.
-function updateSub() {
-  $('subField').hidden = $('overlap').value === 'cut';
-  for (const o of $('sub').options) o.hidden = +o.value > 0 && +o.value >= +$('floor').value;
-  if ($('sub').selectedOptions[0].hidden) $('sub').value = '0';
-}
+// The helper is hidden when overlapping melody notes are cut.
+function updateSub() { $('subField').hidden = $('overlap').value === 'cut'; }
 updateSub();
 $('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = $('tempo').onchange = () => renderMml();
 $('floor').onchange = $('overlap').onchange = () => { updateSub(); renderMml(); };
