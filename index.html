@@ -89,7 +89,9 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <label class="field" for="beat" title="倍にすると同じ速さのままテンポを倍で書き、細かいリズムを拾います">拍
         <select id="beat"><option value="1" selected>そのまま</option><option value="2">倍（文字数増）</option></select>
       </label>
-      <label class="field" title="オフにすると途中のテンポ変化をメロディに書き込みます"><input type="checkbox" id="fixed" checked>テンポを固定（オフで変化を反映・文字数増）</label>
+      <label class="field" for="tempo" title="テンポが変わらない曲は「等間隔」にすると、拍が裏拍にずれても崩れません">テンポ
+        <select id="tempo"><option value="fixed" selected>拍を検出（テンポ固定）</option><option value="vary">拍を検出（テンポ変化を書く・文字数増）</option><option value="steady">等間隔（裏拍に強い・テンポの揺れに弱い）</option></select>
+      </label>
       <label class="field" for="chords">使える音数（メロディ込み）
         <select id="chords"><option value="1">2音</option><option value="2" selected>3音</option><option value="3">4音</option><option value="4">5音</option><option value="5">6音</option></select>
       </label>
@@ -587,6 +589,33 @@ function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap
   const parts = [melody.length ? partMml(melody, bpm, marks) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
 }
+// Evenly spaced beats: the tempo and offset that best fit the MIDI's own beats, for songs that keep one tempo.
+// Notes are re-timed from seconds onto that grid at 480 ticks per beat. Returns { raw, bpm }.
+function steadyGrid(raw, tempos, ppq) {
+  const map = [];
+  let sec = 0, last = { tick: 0, spb: .5 };
+  for (const e of tempos.length ? tempos : [{ tick: 0, spb: .5 }]) { sec += (e.tick - last.tick) / ppq * last.spb; map.push([e.tick, sec, e.spb]); last = e; }
+  const seconds = tick => { const x = map.findLast(x => x[0] <= tick) || [0, 0, .5]; return x[1] + (tick - x[0]) / ppq * x[2]; };
+  const end = Math.max(...raw.map(n => n.endTick)), beats = [];
+  for (let tick = 0; tick <= end; tick += ppq) beats.push(seconds(tick));
+  if (beats.length < 4) return { raw, bpm: 60 / map[0][2] };
+  const gaps = beats.slice(1).map((b, i) => b - beats[i]).sort((a, b) => a - b);
+  const median = 60 / gaps[gaps.length >> 1];
+  let best = -1, period = 60 / median;
+  // Phase coherence: how tightly the beats line up on a grid of each tempo.
+  for (let bpm = median * .92; bpm < median * 1.08; bpm += .01) {
+    let re = 0, im = 0;
+    for (const b of beats) { const a = 2 * Math.PI * b * bpm / 60; re += Math.cos(a); im += Math.sin(a); }
+    const fit = Math.hypot(re, im);
+    if (fit > best) { best = fit; period = 60 / bpm; }
+  }
+  let re = 0, im = 0;
+  for (const b of beats) { const a = 2 * Math.PI * b / period; re += Math.cos(a); im += Math.sin(a); }
+  const offset = ((Math.atan2(im, re) / (2 * Math.PI) * period) % period + period) % period;
+  // One extra beat in front keeps notes before the first grid beat at positive ticks.
+  const toTick = t => Math.round(((t - offset) / period + 1) * 480);
+  return { raw: raw.map(n => ({ ...n, tick: toTick(seconds(n.tick)), endTick: toTick(seconds(n.endTick)) })), bpm: 60 / period };
+}
 /*MML-END*/
 
 function toast(msg) {
@@ -620,7 +649,7 @@ function demoSong() {
   });
   for (const n of [...bass, ...arp, ...top]) { n.tick = Math.round(n.t * 480); n.endTick = Math.round((n.t + n.d) * 480); n.vel = Math.round(n.v * 127); }
   const mk = (name, notes, i) => ({ name, notes, drums: false, muted: false, color: COLORS[i], profile: PROFILES.piano });
-  return { name: 'サンプル曲（MIDIをドロップして変換）', duration: 64, bpm: 60, ppq: 480, tempoCount: 1, tracks: [mk('旋律', top, 0), mk('分散和音', arp, 1), mk('低音', bass, 2)] };
+  return { name: 'サンプル曲（MIDIをドロップして変換）', duration: 64, bpm: 60, ppq: 480, tempoCount: 1, tempos: [{ tick: 0, spb: 1 }], tracks: [mk('旋律', top, 0), mk('分散和音', arp, 1), mk('低音', bass, 2)] };
 }
 
 /* Drawing */
@@ -795,8 +824,10 @@ async function copyText(text, btn) {
 }
 
 function renderMml(fromStart) {
-  const raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes);
-  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value, $('fixed').checked ? null : source.tempos || []);
+  let raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes), ppq = source.ppq, bpm = source.bpm;
+  const tempo = $('tempo').value;
+  if (tempo === 'steady') ({ raw, bpm } = steadyGrid(raw, source.tempos || [], ppq)), ppq = 480;
+  result = convertMml(raw, ppq, Math.round(bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value, tempo === 'vary' ? source.tempos || [] : null);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -831,7 +862,7 @@ function updateSub() {
   if ($('sub').selectedOptions[0].hidden) $('sub').value = '0';
 }
 updateSub();
-$('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = $('fixed').onchange = () => renderMml();
+$('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = $('tempo').onchange = () => renderMml();
 $('floor').onchange = $('overlap').onchange = () => { updateSub(); renderMml(); };
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
