@@ -78,9 +78,6 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
   <div class="bar transport">
     <button id="play" aria-label="再生">▶</button>
     <div class="seek"><span id="cur">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" aria-label="再生位置"><span id="total">0:00</span></div>
-    <label class="ctl" for="speed">速度
-      <select id="speed"><option value="0.5">×0.5</option><option value="0.75">×0.75</option><option value="1" selected>×1</option><option value="1.25">×1.25</option><option value="1.5">×1.5</option></select>
-    </label>
     <label class="ctl" for="vol">音量 <input id="vol" type="range" min="0" max="100" value="75"></label>
   </div>
   <div class="bar" id="tracks"></div>
@@ -89,6 +86,9 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <div class="field">クオンタイズ
         <div class="seg" id="grid"><button data-v="8" aria-pressed="false">8分</button><button data-v="16" aria-pressed="true">16分</button><button data-v="32" aria-pressed="false">32分</button></div>
       </div>
+      <label class="field" for="beat" title="倍にすると同じ速さのままテンポを倍で書き、細かいリズムを拾います">拍
+        <select id="beat"><option value="1" selected>そのまま</option><option value="2">倍（文字数増）</option></select>
+      </label>
       <label class="field" for="chords">使える音数（メロディ込み）
         <select id="chords"><option value="1">2音</option><option value="2" selected>3音</option><option value="3">4音</option><option value="4">5音</option><option value="5">6音</option></select>
       </label>
@@ -100,6 +100,9 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       </label>
       <label class="field" for="overlap" title="メロディの音が次の音と重なったときの扱い">メロディが重なった時
         <select id="overlap"><option value="chord" selected>和音に回す</option><option value="cut">カットしてメロディ</option></select>
+      </label>
+      <label class="field" id="subField" for="sub" title="メロディの下限より下で、この音までのメロディを和音1に優先して入れます（音域で固定のとき）">和音1でメロディ補助
+        <select id="sub"><option value="0" selected>なし</option><option value="48">C3から</option><option value="55">G3から</option><option value="60">C4から</option><option value="67">G4から</option></select>
       </label>
     </div>
     <div class="row"><div id="parts"></div><span class="hint">ボタンをタップしてコピー</span><button class="btn primary" id="saveMml">MMLを保存</button></div>
@@ -399,7 +402,8 @@ function quantize(raw, ppq, grid) {
   return notes;
 }
 
-function pickMelody(notes, floor, overlap = 'chord') {
+// spill, when given, collects start*128+pitch of notes handed to the chords only because the melody overlapped them.
+function pickMelody(notes, floor, overlap = 'chord', spill = null) {
   const ordered = notes.slice().sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]);
   const groups = new Map();
   ordered.forEach((n, i) => {
@@ -408,7 +412,10 @@ function pickMelody(notes, floor, overlap = 'chord') {
       const q = ordered[k];
       if (q[0] < n[0] - 480) break;
       // A higher note still ringing is the melody; with "cut", only when it rings through this whole note.
-      if (q[0] < n[0] && n[0] < q[1] && q[2] > n[2] && (overlap === 'chord' || q[1] >= n[1])) return;
+      if (q[0] < n[0] && n[0] < q[1] && q[2] > n[2] && (overlap === 'chord' || q[1] >= n[1])) {
+        if (spill && q[1] < n[1]) spill.add(n[0] * 128 + n[2]);
+        return;
+      }
     }
     if (!groups.has(n[0])) groups.set(n[0], []);
     groups.get(n[0]).push(n);
@@ -494,7 +501,8 @@ function partMml(notes, bpm) {
   return mml;
 }
 
-function splitRanges(notes, count) {
+// spill: notes the melody overlapped or let go; they take the first free part (chord 1, then 2, ...).
+function splitRanges(notes, count, spill = new Set()) {
   // Keep exactly the notes splitVoices keeps, then lay them out like soprano, alto, tenor: each part keeps its own range.
   const { voices: lines, dropped } = splitVoices(notes, count);
   const kept = lines.flat(), voices = Array.from({ length: count }, () => []);
@@ -506,6 +514,10 @@ function splitRanges(notes, count) {
     const chord = groups.get(start).slice().sort((a, b) => b[2] - a[2]);
     // Parts still holding a note are skipped; the kept notes never overlap more than count, so all fit.
     const free = [...voices.keys()].filter(v => !voices[v].length || voices[v].at(-1)[1] <= start);
+    for (const note of chord.filter(n => spill.has(n[0] * 128 + n[2]))) {
+      voices[free.shift()].push(note);
+      chord.splice(chord.indexOf(note), 1);
+    }
     const k = chord.length, m = free.length, f = Array.from({ length: k + 1 }, (_, a) => Array(m + 1).fill(a ? Infinity : 0));
     for (let a = 1; a <= k; a++) for (let b = a; b <= m; b++) f[a][b] = Math.min(f[a][b - 1], f[a - 1][b - 1] + Math.abs(chord[a - 1][2] - center[free[b - 1]]));
     for (let a = k, b = m; a;) {
@@ -519,12 +531,18 @@ function splitRanges(notes, count) {
   return { voices, dropped };
 }
 
-function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord') {
+// sub: a lower melody floor; melody notes between sub and floor go to chord 1 first (with split "range").
+// beat 2 doubles the beat: same speed, written at twice the tempo with longer note lengths.
+function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord', sub = 0, beat = 1) {
   const clipped = raw.filter(n => n.m > MAX_PITCH).length;
-  const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq, grid);
-  const melody = pickMelody(notes, floor, overlap);
+  const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq / beat, grid);
+  bpm *= beat;
+  const spill = new Set();
+  const melody = pickMelody(notes, floor, overlap, spill);
   const taken = new Set(melody.map(n => n[0] * 128 + n[2]));
-  const { voices, dropped } = (split === 'range' ? splitRanges : splitVoices)(notes.filter(n => !taken.has(n[0] * 128 + n[2])), chords);
+  if (sub && sub < floor) for (const n of pickMelody(notes, sub, overlap)) if (!taken.has(n[0] * 128 + n[2])) spill.add(n[0] * 128 + n[2]);
+  const rest = notes.filter(n => !taken.has(n[0] * 128 + n[2]));
+  const { voices, dropped } = split === 'range' ? splitRanges(rest, chords, spill) : splitVoices(rest, chords);
   const parts = [melody.length ? partMml(melody, bpm) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
 }
@@ -662,10 +680,6 @@ const css0 = () => getComputedStyle(document.documentElement).getPropertyValue('
 /* Controls */
 $('play').onclick = () => playing ? pause() : play();
 $('seek').oninput = () => { seeking = true; moveTo($('seek').value / 1000 * song.duration); seeking = false; };
-$('speed').onchange = e => {
-  const t = now(); speed = +e.target.value;
-  if (playing) { songPos = t; moveTo(t); }
-};
 $('vol').oninput = e => { if (master) master.gain.value = e.target.value / 100; };
 $('file').onchange = e => { openFile(e.target.files[0]); e.target.value = ''; };
 $('openBtn').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } };
@@ -734,7 +748,7 @@ async function copyText(text, btn) {
 
 function renderMml(fromStart) {
   const raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes);
-  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value);
+  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -763,7 +777,15 @@ $('grid').onclick = e => {
   for (const x of $('grid').children) x.setAttribute('aria-pressed', x === b);
   renderMml();
 };
-$('chords').onchange = $('floor').onchange = $('split').onchange = $('overlap').onchange = () => renderMml();
+// The helper only offers starts below the melody floor, and is hidden when overlapping melody notes are cut.
+function updateSub() {
+  $('subField').hidden = $('overlap').value === 'cut';
+  for (const o of $('sub').options) o.hidden = +o.value > 0 && +o.value >= +$('floor').value;
+  if ($('sub').selectedOptions[0].hidden) $('sub').value = '0';
+}
+updateSub();
+$('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = () => renderMml();
+$('floor').onchange = $('overlap').onchange = () => { updateSub(); renderMml(); };
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([$('mmlText').value], { type: 'text/plain' }));
