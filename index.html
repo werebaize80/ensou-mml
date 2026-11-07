@@ -89,6 +89,7 @@ canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block
       <label class="field" for="beat" title="倍にすると同じ速さのままテンポを倍で書き、細かいリズムを拾います">拍
         <select id="beat"><option value="1" selected>そのまま</option><option value="2">倍（文字数増）</option></select>
       </label>
+      <label class="field" title="オフにすると途中のテンポ変化をメロディに書き込みます"><input type="checkbox" id="fixed" checked>テンポを固定（オフで変化を反映・文字数増）</label>
       <label class="field" for="chords">使える音数（メロディ込み）
         <select id="chords"><option value="1">2音</option><option value="2" selected>3音</option><option value="3">4音</option><option value="4">5音</option><option value="5">6音</option></select>
       </label>
@@ -378,7 +379,7 @@ function parseMidi(b, fileName) {
     return { name: r.name || (drums ? 'ドラム' : `トラック${i + 1}`), drums, notes, muted: false, color: COLORS[i % COLORS.length], profile: PROFILES[FAMILIES[r.program >> 3]] };
   });
   const changed = unique.filter((e, i) => i && e.spb !== unique[i - 1].spb).length;
-  return { name: fileName.replace(/\.midi?$/i, ''), duration, bpm: 60 / unique[0].spb, ppq, tempoCount: changed + 1, tracks };
+  return { name: fileName.replace(/\.midi?$/i, ''), duration, bpm: 60 / unique[0].spb, ppq, tempoCount: changed + 1, tempos: unique, tracks };
 }
 
 /*MML-START*/
@@ -484,7 +485,40 @@ function lengthsOf(ticks) {
   return out.length ? out : ['64'];
 }
 
-function partMml(notes, bpm) {
+// Whole-BPM tempo changes from the MIDI tempo map (tempos: {tick, spb} in source ticks; scale turns them into 480 per beat).
+// Changes land only on a note start where no part holds a note, and only when the tempo would drift over 0.03 s.
+function tempoMarks(parts, tempos, ppq, scale) {
+  const table = [];
+  let sec = 0, last = { tick: 0, spb: .5 };
+  for (const e of tempos.length ? tempos : [{ tick: 0, spb: .5 }]) { sec += (e.tick - last.tick) / ppq * last.spb; table.push([e.tick * scale, sec, e.spb]); last = e; }
+  const seconds = t => { const x = table.findLast(x => x[0] <= t) || [0, 0, .5]; return x[1] + (t - x[0]) / scale / ppq * x[2]; };
+  const spans = parts.flat().map(n => [n[0], n[1]]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const ticks = [...new Set([0, ...spans.map(n => n[0])])].sort((a, b) => a - b), safe = [];
+  let k = 0, reach = 0;
+  for (const t of ticks) {
+    while (k < spans.length && spans[k][0] < t) reach = Math.max(reach, spans[k++][1]);
+    if (reach <= t) safe.push(t);
+  }
+  const marks = new Map();
+  let now = 0, bpm = null;
+  for (let i = 0; i + 1 < safe.length; i++) {
+    const a = safe[i], b = safe[i + 1], want = seconds(b), beats = (b - a) / 480 * 60;
+    if (bpm === null || Math.abs(now + beats / bpm - want) > .03) {
+      // Follow this stretch's own tempo, catching up on drift by at most 5% so short stretches stay sane.
+      const local = beats / Math.max(want - seconds(a), 1e-6), cat = beats / Math.max(want - now, 1e-6);
+      const v = Math.max(1, pyRound(Math.min(Math.max(cat, local * .95), local * 1.05)));
+      if (v !== bpm) marks.set(a, bpm = v);
+    }
+    now += beats / bpm;
+  }
+  return marks;
+}
+// Python's round (half to even), so the local tool and this page pick the same tempos.
+function pyRound(x) { const r = Math.round(x); return Math.abs(x % 1) === .5 && r % 2 ? r - 1 : r; }
+
+function partMml(notes, bpm, marks = new Map()) {
+  const todo = [...marks].sort((a, b) => a[0] - b[0]);
+  if (todo.length && todo[0][0] === 0) bpm = todo.shift()[1];
   const counts = new Map();
   for (const n of notes) for (const t of lengthsOf(n[1] - n[0])) counts.set(t, (counts.get(t) || 0) + 1);
   let def = '', top = 0;
@@ -492,6 +526,11 @@ function partMml(notes, bpm) {
   const show = t => t === def ? '' : t;
   let mml = (bpm ? `t${bpm}` : '') + `o4l${def}`, octave = 4, pos = 0;
   for (const [start, end, pitch] of notes) {
+    while (todo.length && todo[0][0] <= start) {
+      const [at, value] = todo.shift();
+      if (at > pos) { mml += lengthsOf(at - pos).map(t => 'r' + show(t)).join(''); pos = at; }
+      mml += 't' + value;
+    }
     if (start > pos) mml += lengthsOf(start - pos).map(t => 'r' + show(t)).join('');
     const target = Math.floor(pitch / 12), diff = target - octave;
     if (diff) { mml += Math.abs(diff) <= 2 ? (diff > 0 ? '>'.repeat(diff) : '<'.repeat(-diff)) : `o${target}`; octave = target; }
@@ -532,8 +571,9 @@ function splitRanges(notes, count, spill = new Set()) {
 }
 
 // sub: a lower melody floor; melody notes between sub and floor go to chord 1 first (with split "range").
+// tempos: the MIDI tempo map; when given, tempo changes are written into the melody part (longer MML).
 // beat 2 doubles the beat: same speed, written at twice the tempo with longer note lengths.
-function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord', sub = 0, beat = 1) {
+function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap = 'chord', sub = 0, beat = 1, tempos = null) {
   const clipped = raw.filter(n => n.m > MAX_PITCH).length;
   const notes = quantize(raw.map(n => ({ ...n, m: Math.min(n.m, MAX_PITCH) })), ppq / beat, grid);
   bpm *= beat;
@@ -543,7 +583,8 @@ function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap
   if (sub && sub < floor) for (const n of pickMelody(notes, sub, overlap)) if (!taken.has(n[0] * 128 + n[2])) spill.add(n[0] * 128 + n[2]);
   const rest = notes.filter(n => !taken.has(n[0] * 128 + n[2]));
   const { voices, dropped } = split === 'range' ? splitRanges(rest, chords, spill) : splitVoices(rest, chords);
-  const parts = [melody.length ? partMml(melody, bpm) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
+  const marks = tempos && melody.length ? tempoMarks([melody, ...voices], tempos, ppq, 480 * beat / ppq) : undefined;
+  const parts = [melody.length ? partMml(melody, bpm, marks) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
 }
 /*MML-END*/
@@ -706,10 +747,10 @@ const SEMITONES = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
 // Rebuild notes from the MML text itself, so the preview plays exactly what gets pasted into the game.
 function parseMml(text) {
   const size = token => 1920 / parseInt(token) * (token.endsWith('.') ? 1.5 : 1);
-  const notes = [];
+  const notes = [], tempos = [];
   let octave = 4, def = 480, pos = 0, tie = false, bpm = 120;
   for (const m of text.matchAll(/t(\d+)|o(\d)|l(\d+\.?)|([<>&])|([a-gr])(\+?)(\d+\.?)?/g)) {
-    if (m[1]) bpm = +m[1];
+    if (m[1]) { bpm = +m[1]; tempos.push({ tick: pos, bpm }); }
     else if (m[2]) octave = +m[2];
     else if (m[3]) def = size(m[3]);
     else if (m[4]) { if (m[4] === '&') tie = true; else octave += m[4] === '>' ? 1 : -1; }
@@ -723,16 +764,23 @@ function parseMml(text) {
       pos += len;
     }
   }
-  return { notes, bpm };
+  return { notes, bpm, tempos };
 }
 
 function mmlSong(parts) {
-  const bpm = parseMml(parts[0]).bpm, sec = 60 / bpm / 480;
+  // Tempo changes in the melody part steer every part.
+  const map = [];
+  let at = 0, last = { tick: 0, bpm: 120 };
+  for (const e of parseMml(parts[0]).tempos) { at += (e.tick - last.tick) * 60 / last.bpm / 480; map.push({ tick: e.tick, at, bpm: e.bpm }); last = e; }
+  if (!map.length || map[0].tick > 0) map.unshift({ tick: 0, at: 0, bpm: 120 });
+  const time = tick => { const e = map.findLast(x => x.tick <= tick); return e.at + (tick - e.tick) * 60 / e.bpm / 480; };
+  const bpm = map[0].bpm;
   let duration = 0;
   const tracks = parts.map((part, i) => {
     const notes = parseMml(part).notes.map(n => {
-      duration = Math.max(duration, n.end * sec);
-      return { t: n.start * sec, d: (n.end - n.start) * sec, off: n.end * sec, m: n.m, v: .7 };
+      const t = time(n.start), off = time(n.end);
+      duration = Math.max(duration, off);
+      return { t, d: off - t, off, m: n.m, v: .7 };
     });
     return { name: i ? `和音${i}` : 'メロディ', notes, drums: false, muted: song?.tracks[i]?.muted || false, color: COLORS[i], profile: PROFILES.piano };
   });
@@ -748,7 +796,7 @@ async function copyText(text, btn) {
 
 function renderMml(fromStart) {
   const raw = source.tracks.filter(t => !t.drums).flatMap(t => t.notes);
-  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value);
+  result = convertMml(raw, source.ppq, Math.round(source.bpm), grid, +$('chords').value, +$('floor').value, $('split').value, $('overlap').value, $('subField').hidden ? 0 : +$('sub').value, +$('beat').value, $('fixed').checked ? null : source.tempos || []);
   $('mmlText').value = result.parts.join('\n');
   const wasPlaying = playing, at = fromStart === true ? 0 : now();
   loadSong(mmlSong(result.parts));
@@ -767,7 +815,6 @@ function renderMml(fromStart) {
   if (result.parts.some(p => p.length > PART_LIMIT)) notes.push(`上限${PART_LIMIT}字を超えたパートがあります。クオンタイズを粗くしてください。`);
   if (result.dropped) notes.push(`${result.dropped}音は音数に入りきらず省きました。`);
   if (result.clipped) notes.push(`${result.clipped}音は音域外のため補正しました。`);
-  if (source.tempoCount > 1) notes.push(`途中のテンポ変更（${source.tempoCount - 1}回）は反映せず、最初のテンポで出力します。`);
   $('mmlNote').textContent = notes.join(' ');
 }
 
@@ -784,7 +831,7 @@ function updateSub() {
   if ($('sub').selectedOptions[0].hidden) $('sub').value = '0';
 }
 updateSub();
-$('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = () => renderMml();
+$('chords').onchange = $('split').onchange = $('sub').onchange = $('beat').onchange = $('fixed').onchange = () => renderMml();
 $('floor').onchange = $('overlap').onchange = () => { updateSub(); renderMml(); };
 $('saveMml').onclick = () => {
   const a = document.createElement('a');
