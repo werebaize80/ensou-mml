@@ -537,6 +537,10 @@ function partMml(notes, bpm, marks = new Map()) {
     mml += lengthsOf(end - start).map(t => NAMES[pitch % 12] + show(t)).join('&');
     pos = end;
   }
+  for (const [at, value] of todo) {
+    if (at > pos) { mml += lengthsOf(at - pos).map(t => 'r' + show(t)).join(''); pos = at; }
+    mml += 't' + value;
+  }
   return mml;
 }
 
@@ -651,53 +655,65 @@ function convertMml(raw, ppq, bpm, grid, chords, floor, split = 'range', overlap
   bpm *= beat;
   const key = n => n[0] * 128 + n[2], bar = n => Math.floor(n[0] / 1920);
   const spill = new Set();
-  let melody = pickMelody(notes, floor, overlap, spill);
+  const full = pickMelody(notes, floor, overlap, spill);
   const rank = new Map([...spill].map(k => [k, 0])); // chord 1 priority: 0 melody overlaps, 1 second line, 2 melody overflow
+  let order = [];
+  const moved = new Set();
   if (sub) {
-    const first = new Set(melody.map(key));
+    const first = new Set(full.map(key));
     for (const n of pickMelody(notes.filter(n => !first.has(key(n))), floor, overlap)) if (!rank.has(key(n))) rank.set(key(n), 1);
-    const guess = tempos && melody.length ? tempoMarks([notes], tempos, ppq, 480 * beat / ppq) : undefined;
-    if (melody.length && partMml(melody, bpm, guess).length > PART_LIMIT) {
-      // Hand whole measures of melody to chord 1 until the melody fits, the emptiest measures first,
-      // so chord 1 still has room for chords spread over the song.
-      const busy = new Map();
-      for (const n of notes) if (!first.has(key(n))) busy.set(bar(n), (busy.get(bar(n)) || 0) + 1);
-      const moved = new Set();
-      for (const b of [...new Set(melody.map(bar))].sort((x, y) => (busy.get(x) || 0) - (busy.get(y) || 0) || x - y)) {
+    // Measures of melody that may go to chord 1, the emptiest first, so chord 1 still has room
+    // for chords spread over the song.
+    const busy = new Map();
+    for (const n of notes) if (!first.has(key(n))) busy.set(bar(n), (busy.get(bar(n)) || 0) + 1);
+    order = [...new Set(full.map(bar))].sort((x, y) => (busy.get(x) || 0) - (busy.get(y) || 0) || x - y);
+    const guess = tempos && full.length ? tempoMarks([notes], tempos, ppq, 480 * beat / ppq) : undefined;
+    if (full.length && partMml(full, bpm, guess).length > PART_LIMIT) {
+      for (const b of order) {
         moved.add(b);
-        if (partMml(melody.filter(n => !moved.has(bar(n))), bpm, guess).length <= PART_LIMIT) break;
+        if (partMml(full.filter(n => !moved.has(bar(n))), bpm, guess).length <= PART_LIMIT) break;
       }
-      for (const n of melody) if (moved.has(bar(n)) && !rank.has(key(n))) rank.set(key(n), 2);
-      melody = melody.filter(n => !moved.has(bar(n)));
     }
   }
-  const taken = new Set(melody.map(key));
-  const rest = notes.filter(n => !taken.has(key(n)));
-  const keep = sub ? rank : new Map();
-  let voices, dropped;
-  if (split !== 'range') {
-    ({ voices, dropped } = splitVoices(rest, chords));
-    voices = balance(voices);
-  } else {
-    ({ voices, dropped } = splitRanges(rest, chords, rank, !!sub));
-    voices = balance(voices, keep);
-    if (sub && voices[0].length && partMml(voices[0]).length > PART_LIMIT) {
-      // Chord 1 is over the limit: keep the other chords out of it, measure by measure,
-      // starting where it holds the most of them, until it fits.
-      const extra = new Map();
-      for (const n of voices[0]) if (!rank.has(key(n))) extra.set(bar(n), (extra.get(bar(n)) || 0) + 1);
-      const order = [...extra].sort((x, y) => y[1] - x[1]).map(x => x[0]);
-      let lo = 1, hi = order.length, best = null;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1, trial = splitRanges(rest, chords, rank, true, new Set(order.slice(0, mid)));
-        trial.voices = balance(trial.voices, keep);
-        if (!trial.voices[0].length || partMml(trial.voices[0]).length <= PART_LIMIT) { best = trial; hi = mid - 1; } else lo = mid + 1;
+  const arrange = () => {
+    const melody = full.filter(n => !moved.has(bar(n)));
+    const ranks = new Map(rank);
+    for (const n of full) if (moved.has(bar(n)) && !ranks.has(key(n))) ranks.set(key(n), 2);
+    const taken = new Set(melody.map(key));
+    const rest = notes.filter(n => !taken.has(key(n)));
+    const keep = sub ? ranks : new Map();
+    let voices, dropped;
+    if (split !== 'range') {
+      ({ voices, dropped } = splitVoices(rest, chords));
+      voices = balance(voices);
+    } else {
+      ({ voices, dropped } = splitRanges(rest, chords, ranks, !!sub));
+      voices = balance(voices, keep);
+      if (sub && voices[0].length && partMml(voices[0]).length > PART_LIMIT) {
+        // Chord 1 is over the limit: keep the other chords out of it, measure by measure,
+        // starting where it holds the most of them, until it fits.
+        const extra = new Map();
+        for (const n of voices[0]) if (!ranks.has(key(n))) extra.set(bar(n), (extra.get(bar(n)) || 0) + 1);
+        const bars = [...extra].sort((x, y) => y[1] - x[1]).map(x => x[0]);
+        let lo = 1, hi = bars.length, best = null;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1, trial = splitRanges(rest, chords, ranks, true, new Set(bars.slice(0, mid)));
+          trial.voices = balance(trial.voices, keep);
+          if (!trial.voices[0].length || partMml(trial.voices[0]).length <= PART_LIMIT) { best = trial; hi = mid - 1; } else lo = mid + 1;
+        }
+        if (best) ({ voices, dropped } = best);
       }
-      if (best) ({ voices, dropped } = best);
     }
+    const marks = tempos && melody.length ? tempoMarks([melody, ...voices], tempos, ppq, 480 * beat / ppq) : undefined;
+    return { parts: [melody.length ? partMml(melody, bpm, marks) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))], dropped };
+  };
+  let { parts, dropped } = arrange();
+  // The tempo changes written into the melody can still push it over the limit:
+  // keep handing the next measure to chord 1 under the same rule until it fits.
+  for (const b of order) {
+    if (!sub || parts[0].length <= PART_LIMIT) break;
+    if (!moved.has(b)) { moved.add(b); ({ parts, dropped } = arrange()); }
   }
-  const marks = tempos && melody.length ? tempoMarks([melody, ...voices], tempos, ppq, 480 * beat / ppq) : undefined;
-  const parts = [melody.length ? partMml(melody, bpm, marks) : `t${bpm}`, ...voices.filter(v => v.length).map(v => partMml(v))];
   return { parts, dropped, clipped };
 }
 // Evenly spaced beats: the tempo and offset that best fit the MIDI's own beats, for songs that keep one tempo.
